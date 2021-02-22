@@ -1,17 +1,13 @@
-
 import asyncio
-import typing
+
 import discord
 import youtube_dl
-import re
 
-from discord.ext import commands
+from discord.ext import commands, tasks
+from discord.utils import get
 
 # Suppress noise about console usage from errors
 youtube_dl.utils.bug_reports_message = lambda: ''
-
-
-
 
 ytdl_format_options = {
     'format': 'bestaudio/best',
@@ -24,7 +20,7 @@ ytdl_format_options = {
     'quiet': True,
     'no_warnings': True,
     'default_search': 'auto',
-    'source_address': '0.0.0.0' # bind to ipv4 since ipv6 addresses cause issues sometimes
+    'source_address': '0.0.0.0'  # bind to ipv4 since ipv6 addresses cause issues sometimes
 }
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
@@ -55,6 +51,14 @@ class YTDLSource(discord.PCMVolumeTransformer):
 class Music(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.ctx = None
+        self.voice = None
+        self.current_bot_chan = None
+    @tasks.loop(seconds=5.0)
+    async def cleanup(self):
+        if self.voice and not self.voice.is_playing() and not self.voice.is_paused():
+            await self.disconnect()
+            self.cleanup.cancel()
 
     @commands.command()
     async def join(self, ctx, *, channel: discord.VoiceChannel):
@@ -65,50 +69,81 @@ class Music(commands.Cog):
 
         await channel.connect()
 
-    @commands.command()
-    async def play(self, ctx, url, timestamp = '0'): # add the arg
-        """Streams from a url (same as yt, but doesn't predownload)"""
-        start = 0
-        stop = 0
+    async def disconnect(self):
+        channel = self.ctx.message.author.voice.channel
 
-        print(timestamp)
-
-        ffmpeg_options = {
-            'options': '-vn'
-        }
-      
-        if '-' in timestamp:
-          args = timestamp.split('-')
-          try: 
-            start =  args[0]
-            stop = args[1]
-
-            ffmpeg_options = {
-            'options': f'-vn -ss {start} -to {stop}'
-            }
-
-          except:
-            await ctx.send("Failed to parse Timestamp Arg: <startTime>-<stopTime> <URL>")
-            return
+        if self.voice.is_connected():
+            await self.voice.disconnect()
+            print(f"The bot has left {channel}")
         else:
-          try:
-            start =  timestamp
-            ffmpeg_options = {
-            'options': f'-vn -ss {start}'
-            }
+            print("Bot was told to leave voice channel, but was not in one")
+            await self.ctx.send("Don't think I am in a voice channel")
 
-          except:
-            await ctx.send("Failed to parse Timestamp Arg: <startTime> <URL>")
-            return
+    @commands.command(pass_context=True, aliases=['p'])
+    async def play(self, ctx, url, timestamp='0'):  # add the arg
+        """Plays audio from a youtube url
+        - Optional Args:
+           -Starting time stamp:
+                (-play <URL> <timeStamp>)
+           -Start/stop time stamp:
+                (-play <URL> <startTime>-<endTime>)"""
 
+        # Suspend Cleanup Routine
+        self.cleanup.cancel()
+
+        # Check Current Bot status
+        if self.voice and self.voice.is_connected():
+            # is it in a diff channel
+
+            if self.current_bot_chan != ctx.message.author.voice.channel:
+                # if idle - disconnect
+                if not self.voice.is_playing() and not self.voice.is_paused():
+                    await self.disconnect()
+                # if not idle - activty error
+                else:
+                    # append onto queue
+                    await ctx.send("Bot Currently busy in {} channel, your audio will play shortly".format(self.current_bot_chan))
+                    self.cleanup.start()
+                    return
+            else:
+                if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
+                    # append onto queue
+                    print("CAUGHT")
+                    self.cleanup.start()
+                    return
+
+        # Save context off
+        self.ctx = ctx
+        self.current_bot_chan = ctx.message.author.voice.channel
+
+        # Parse Time Stamp
+        ffmpeg_options = None
+        if '-' in timestamp:
+            args = timestamp.split('-')
+            start = args[0]
+            stop = args[1]
+            ffmpeg_options = {'options': f'-vn -ss {start} -to {stop}'}
+        else:
+            start = timestamp
+            ffmpeg_options = {'options': f'-vn -ss {start}'}
+
+        # Join the channel
+        if ctx.voice_client is None:
+            if ctx.author.voice:
+                await ctx.author.voice.channel.connect()
+            else:
+                await ctx.send("You are not connected to a voice channel.")
+                raise commands.CommandError("Author not connected to a voice channel.")
+
+        # Play the audio
         async with ctx.typing():
-            try:
-              player = await YTDLSource.from_url(url, ffmpeg_options, loop=self.bot.loop, stream=True)
-            except:
-              await ctx.send("Failed to play audio check arguments")
+            self.voice = ctx.voice_client
+            player = await YTDLSource.from_url(url, ffmpeg_options, loop=self.bot.loop)
             ctx.voice_client.play(player, after=lambda e: print('Player error: %s' % e) if e else None)
 
         await ctx.send('Now playing: {}'.format(player.title))
+        print(self.voice.is_playing())
+        self.cleanup.start()
 
     @commands.command()
     async def volume(self, ctx, volume: int):
@@ -124,22 +159,46 @@ class Music(commands.Cog):
     async def stop(self, ctx):
         """Stops and disconnects the bot from voice"""
 
-        await ctx.voice_client.disconnect()
+        await  self.voice.disconnect()
 
-    @play.before_invoke
-    # @stream.before_invoke
-    async def ensure_voice(self, ctx):
-        if ctx.voice_client is None:
-            if ctx.author.voice:
-                await ctx.author.voice.channel.connect()
-            else:
-                await ctx.send("You are not connected to a voice channel.")
-                raise commands.CommandError("Author not connected to a voice channel.")
-        elif ctx.voice_client.is_playing():
-            ctx.voice_client.stop()
+    @commands.command(pass_context=True, aliases=['pa', 'pau'])
+    async def pause(self, ctx):
+
+        if self.voice and self.voice.is_playing():
+            print("Music paused")
+            self.voice.pause()
+            await ctx.send("Music paused")
+        else:
+            print("Music not playing failed pause")
+            await ctx.send("Music not playing failed pause")
+
+    @commands.command(pass_context=True, aliases=['r', 'res'])
+    async def resume(self, ctx):
+
+        if self.voice and self.voice.is_paused():
+            print("Resumed music")
+            self.voice.resume()
+            await ctx.send("Resumed music")
+        else:
+            print("Music is not paused")
+            await ctx.send("Music is not paused")
+
+    @commands.command(pass_context=True, aliases=['s', 'sto'])
+    async def stop(self, ctx):
+        #queues.clear()
+
+        if self.voice and self.voice.is_playing():
+            print("Music stopped")
+            self.voice.stop()
+            await ctx.send("Music stopped")
+        else:
+            print("No music playing failed to stop")
+            await ctx.send("No music playing failed to stop")
+
 
 bot = commands.Bot(command_prefix=commands.when_mentioned_or("!"),
                    description='Relatively simple music bot example')
 
+
 def setup(client):
-  client.add_cog(Music(bot))
+    client.add_cog(Music(bot))

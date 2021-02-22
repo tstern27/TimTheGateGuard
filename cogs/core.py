@@ -18,6 +18,7 @@ class Core(commands.Cog):
   @commands.command()
   @commands.has_permissions(manage_messages=True)
   async def why(self,ctx):
+    """M O N K E"""
     await(ctx.send('M O N K E'))
 
   
