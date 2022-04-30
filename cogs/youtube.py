@@ -1,5 +1,4 @@
 import asyncio
-
 import discord
 import youtube_dl
 
@@ -36,7 +35,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.url = data.get('url')
 
     @classmethod
-    async def from_url(cls, url, ffmpeg_options, *, loop=None, stream=False):
+    async def from_url(cls, url, ffmpeg_options, pre_op, *, loop=None, stream=True,):
         loop = loop or asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
@@ -45,7 +44,7 @@ class YTDLSource(discord.PCMVolumeTransformer):
             data = data['entries'][0]
 
         filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+        return cls(discord.FFmpegPCMAudio(filename, before_options=pre_op, **ffmpeg_options), data=data)
 
 
 class Music(commands.Cog):
@@ -54,11 +53,6 @@ class Music(commands.Cog):
         self.ctx = None
         self.voice = None
         self.current_bot_chan = None
-    @tasks.loop(seconds=5.0)
-    async def cleanup(self):
-        if self.voice and not self.voice.is_playing() and not self.voice.is_paused():
-            await self.disconnect()
-            self.cleanup.cancel()
 
     @commands.command()
     async def join(self, ctx, *, channel: discord.VoiceChannel):
@@ -68,6 +62,12 @@ class Music(commands.Cog):
             return await ctx.voice_client.move_to(channel)
 
         await channel.connect()
+
+    @commands.command()
+    async def leave(self, ctx):
+        """Leaves a voice channel"""
+        if ctx.voice_client is not None:
+            await ctx.voice_client.disconnect()
 
     async def disconnect(self):
         channel = self.ctx.message.author.voice.channel
@@ -88,9 +88,6 @@ class Music(commands.Cog):
            -Start/stop time stamp:
                 (-play <URL> <startTime>-<endTime>)"""
 
-        # Suspend Cleanup Routine
-        self.cleanup.cancel()
-
         # Check Current Bot status
         if self.voice and self.voice.is_connected():
             # is it in a diff channel
@@ -103,13 +100,10 @@ class Music(commands.Cog):
                 else:
                     # append onto queue
                     await ctx.send("Bot Currently busy in {} channel, your audio will play shortly".format(self.current_bot_chan))
-                    self.cleanup.start()
                     return
             else:
                 if self.voice and (self.voice.is_playing() or self.voice.is_paused()):
                     # append onto queue
-                    print("CAUGHT")
-                    self.cleanup.start()
                     return
 
         # Save context off
@@ -122,10 +116,12 @@ class Music(commands.Cog):
             args = timestamp.split('-')
             start = args[0]
             stop = args[1]
-            ffmpeg_options = {'options': f'-vn -ss {start} -to {stop}'}
+            pre_op= f'-ss {start} -to {stop}'
+            ffmpeg_options = {'options': f'-vn'}
         else:
             start = timestamp
-            ffmpeg_options = {'options': f'-vn -ss {start}'}
+            pre_op= f'-ss {start}'
+            ffmpeg_options = {'options': f'-vn'}
 
         # Join the channel
         if ctx.voice_client is None:
@@ -138,12 +134,10 @@ class Music(commands.Cog):
         # Play the audio
         async with ctx.typing():
             self.voice = ctx.voice_client
-            player = await YTDLSource.from_url(url, ffmpeg_options, loop=self.bot.loop)
+            player = await YTDLSource.from_url(url, ffmpeg_options, pre_op, loop=self.bot.loop)
             ctx.voice_client.play(player, after=lambda e: print('Player error: %s' % e) if e else None)
 
         await ctx.send('Now playing: {}'.format(player.title))
-        print(self.voice.is_playing())
-        self.cleanup.start()
 
     @commands.command()
     async def volume(self, ctx, volume: int):
