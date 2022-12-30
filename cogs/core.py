@@ -22,7 +22,5 @@ class Core(commands.Cog):
     await(ctx.send('M O N K E'))
 
   
-
-
-def setup(client):
-  client.add_cog(Core(client))
+async def setup(client):
+  await client.add_cog(Core(client))

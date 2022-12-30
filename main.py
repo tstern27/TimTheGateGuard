@@ -11,9 +11,9 @@ import asyncio
 parser = argparse.ArgumentParser(description='Youtube Discord Bot')
 CONFIG_KEYS = ["TOKEN", "project_path"] # Expected config keys
 
-intents = discord.Intents.default() # Required with discord.py v2.0> 
+intents = discord.Intents.all()
 
-client = commands.Bot(command_prefix = '-', intents = intents, ) # Declare bot
+client = commands.Bot(command_prefix = '-', intents = intents ) # Declare bot
 
 def parse_args():
   print("Parsing command line args...")
@@ -55,8 +55,8 @@ async def main():
 
     TOKEN, project_path = parse_config(config_file_path)
 
-    # await parse_cogs(project_path)
-    # await client.start(TOKEN)
+    await parse_cogs(project_path)
+    await client.start(TOKEN)
 
 if __name__ == "__main__":
     asyncio.run(main())
