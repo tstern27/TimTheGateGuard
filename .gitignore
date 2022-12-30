@@ -1,3 +1,4 @@
 *.pyc
 .env
 nohup.out
+.vscode
