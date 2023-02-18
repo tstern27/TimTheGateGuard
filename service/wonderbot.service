@@ -1,0 +1,11 @@
+[Unit]
+Description=Wonderbot discord bot
+After=multi-user.target
+
+[Service]
+Type=simple
+Restart=always
+ExecStart=/usr/bin/python3 /home/tim/ttgg/main.py /home/tim/ttgg/config/wonderbot.json
+
+[Install]
+WantedBy=multi-user.target
