@@ -12,12 +12,6 @@ class Core(commands.Cog):
   async def on_ready(self):
     print("Bot is online...")
 
-  #@client.event
-  #async def on_command_error(ctx,error):
-  #  if isinstance(error, commands.MissingRequiredArgument):
-  #    await ctx.send("Missing Required Argument")
-  #if isinstance(error, )
-
   @commands.command()
   @commands.has_permissions(manage_messages=True)
   async def ping(self,ctx):
