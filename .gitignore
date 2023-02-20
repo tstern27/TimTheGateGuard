@@ -1,3 +1,6 @@
 *.pyc
 .env
 nohup.out
+.vscode
+config/*
+!config/template.json
