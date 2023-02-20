@@ -1,25 +1,25 @@
 import discord
 from discord.ext import commands
+import time
+from datetime import datetime, timedelta
 
 class Core(commands.Cog):
   def __init__(self,client):
     self.client = client
+    self.st = time.time() # Get start time for ping info
 
   @commands.Cog.listener()
   async def on_ready(self):
     print("Bot is online...")
 
-  #@client.event
-  #async def on_command_error(ctx,error):
-  #  if isinstance(error, commands.MissingRequiredArgument):
-  #    await ctx.send("Missing Required Argument")
-  #if isinstance(error, )
-
   @commands.command()
   @commands.has_permissions(manage_messages=True)
-  async def why(self,ctx):
-    """M O N K E"""
-    await(ctx.send('M O N K E'))
+  async def ping(self,ctx):
+    """Ping Test"""
+    et = time.time()
+    d = datetime.fromtimestamp(int(et-self.st))
+    msg = "Bot has been up for {:d} Days {:d} Hours {:d} Minutes {:d} Seconds".format(d.day-1, d.hour, d.minute, d.second)
+    await(ctx.send(msg))
 
   
 async def setup(client):
