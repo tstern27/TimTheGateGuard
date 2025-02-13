@@ -4,3 +4,6 @@ nohup.out
 .vscode
 config/*
 !config/template.json
+
+#Ignore the venv
+venv

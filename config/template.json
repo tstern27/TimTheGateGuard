@@ -1,4 +1,4 @@
 {
-    "project_path": "<PATH_TO_PROJECT>",
+    "project_path": "<PATH_TO_PROJECT_ROOT>",
     "TOKEN": "<DISCORD_BOT_TOKEN>"
 }

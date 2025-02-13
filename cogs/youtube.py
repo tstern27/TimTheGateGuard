@@ -3,7 +3,7 @@ import discord
 
 import sys
 
-from discord.ext import commands, tasks
+from discord.ext import commands
 from discord.utils import get
 
 sys.path.insert(0,"..")
@@ -14,23 +14,26 @@ class Music(commands.Cog):
         self.bot = bot
         self.vc = None
         self.current_bot_chan = None
+
     @commands.command()
     async def join(self, ctx, *, channel: discord.VoiceChannel):
         """Joins channel supplied by user"""
-
-        if len(self.bot.voice_clients) > 1:
-            return await ctx.send("Too Many Connections -- contact tim")
-        else:
-            for c in ctx.guild.voice_channels:
-                if c is channel:
-                    await c.connect()
-                    if len(self.bot.voice_clients) != 1:
-                        return await ctx.send("Couldn't Parse Voice Client -- contact tim")
-                    self.vc = self.bot.voice_clients[0]
-                    self.current_bot_chan = channel
-                    return
-
-            return await ctx.send("Didn't work -- contact tim")
+        try:
+            if len(self.bot.voice_clients) > 1:
+                return await ctx.send("Too Many Connections -- contact tim")
+            
+            # Direct connection attempt without loop
+            self.vc = await channel.connect(timeout=20.0)  # Add timeout
+            self.current_bot_chan = channel
+            return await ctx.send(f"Connected to {channel.name}")
+            
+        except asyncio.TimeoutError:
+            return await ctx.send("Connection timed out - please try again")
+        except discord.ClientException as e:
+            return await ctx.send(f"Failed to connect: {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error while connecting: {str(e)}")
+            return await ctx.send("An unexpected error occurred while connecting")
 
     @commands.command()
     async def leave(self, ctx):
@@ -41,65 +44,52 @@ class Music(commands.Cog):
            return
 
     @commands.command(pass_context=True, aliases=['p'])
-    async def play(self, ctx, url, timestamp='0'):  # add the arg
-        """Plays audio from a youtube url
-        - Optional Args:
-           -Starting time stamp:
-                (-play <URL> <timeStamp>)
-           -Start/stop time stamp:
-                (-play <URL> <startTime>-<endTime>)"""
+    async def play(self, ctx, url, timestamp='0'):
+        """Plays audio from a youtube url"""
+        try:
+            # Check if user is in a voice channel
+            if not ctx.author.voice:
+                return await ctx.send("You need to be in a voice channel to use this command.")
 
-        # Check Current Bot status
-        if self.vc and self.vc.is_connected():
-            # is it in a diff channel
-            if self.current_bot_chan != ctx.message.author.voice.channel:
-                # if idle - disconnect
-                if not self.vc.is_playing() and not self.vc.is_paused():
-                    await self.vc.disconnect()
-                    self.vc = None
-                # if not idle - activty error
-                else:
-                    # append onto queue
-                    await ctx.send("Bot Currently busy in {} channel, your audio will play shortly".format(self.current_bot_chan))
-                    return
-            else:
-                if self.vc and (self.vc.is_playing() or self.vc.is_paused()):
-                    # append onto queue
-                    return
+            # Connect to voice with timeout
+            if self.vc is None:
+                try:
+                    self.vc = await ctx.author.voice.channel.connect(timeout=20.0)
+                except asyncio.TimeoutError:
+                    return await ctx.send("Connection timed out - please try again")
+                except Exception as e:
+                    return await ctx.send(f"Failed to connect: {str(e)}")
 
-        self.current_bot_chan = ctx.message.author.voice.channel
+            # Parse timestamp
+            ffmpeg_options = {'options': '-vn'}
+            pre_op = '-ss 0'
+            if '-' in timestamp:
+                start, stop = timestamp.split('-')
+                pre_op = f'-ss {start} -to {stop}'
+            elif timestamp != '0':
+                pre_op = f'-ss {timestamp}'
 
-        # Parse Time Stamp
-        ffmpeg_options = None
-        if '-' in timestamp:
-            args = timestamp.split('-')
-            start = args[0]
-            stop = args[1]
-            pre_op= f'-ss {start} -to {stop}'
-            ffmpeg_options = {'options': f'-vn'}
-        else:
-            start = timestamp
-            pre_op= f'-ss {start}'
-            ffmpeg_options = {'options': f'-vn'}
+            # Add status message
+            await ctx.send("Fetching audio... This may take a moment.")
 
-        # Join the channel
-        if self.vc is None:
-            if ctx.author.voice and ctx.author.voice.channel:
-                await ctx.author.voice.channel.connect()
-                if len(self.bot.voice_clients) != 1:
-                    return await ctx.send("Couldn't Parse Voice Client -- contact tim")
-                self.vc = self.bot.voice_clients[0]
+            # Create player with timeout
+            try:
+                async with ctx.typing():
+                    async with asyncio.timeout(30):  # 30 second timeout
+                        player = await YTDLSource.from_url(url, ffmpeg_options, pre_op, loop=self.bot.loop)
+            except asyncio.TimeoutError:
+                return await ctx.send("Timed out while fetching the audio. The URL might be invalid or too long.")
+            except Exception as e:
+                return await ctx.send(f"Error fetching audio: {str(e)}")
 
-            else:
-                await ctx.send("Bot not connected to a voice channel. Please use join command first")
-                return
-
-        # Play the audio
-        async with ctx.typing():
-            player = await YTDLSource.from_url(url, ffmpeg_options, pre_op, loop=self.bot.loop)
+            # Play the audio
             self.vc.play(player, after=lambda e: print('Player error: %s' % e) if e else None)
+            
+            return await ctx.send(f'Now playing: {player.title}')
 
-        return await ctx.send('Now playing: {}'.format(player.title))
+        except Exception as e:
+            print(f"Play command error: {str(e)}")
+            return await ctx.send("An error occurred while trying to play the audio.")
 
     @commands.command()
     async def volume(self, ctx, volume: int):
