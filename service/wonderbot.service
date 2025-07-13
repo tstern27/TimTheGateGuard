@@ -5,7 +5,9 @@ After=multi-user.target
 [Service]
 Type=simple
 Restart=always
-ExecStart=/usr/bin/python3 /home/tim/ttgg/main.py /home/tim/ttgg/config/wonderbot.json
+WorkingDirectory=/home/tim/TimTheGateGuard
+# Use the Python interpreter from your virtual environment
+ExecStart=/home/tim/TimTheGateGuard/venv/bin/python /home/tim/TimTheGateGuard/main.py /home/tim/TimTheGateGuard/config/wonderbot.json
 
 [Install]
 WantedBy=multi-user.target

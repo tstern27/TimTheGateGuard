@@ -4,6 +4,8 @@ import os
 import argparse
 import json
 import asyncio
+import shutil 
+import sys 
 
 parser = argparse.ArgumentParser(description='Youtube Discord Bot')
 CONFIG_KEYS = ["TOKEN", "project_path"] # Expected config keys
@@ -11,6 +13,11 @@ CONFIG_KEYS = ["TOKEN", "project_path"] # Expected config keys
 intents = discord.Intents.all()
 
 client = commands.Bot(command_prefix = '-', intents = intents ) # Declare bot
+
+if not shutil.which('ffmpeg'):
+    print("ERROR: FFmpeg is not installed on this system.")
+    print("Please install FFmpeg using: sudo apt install ffmpeg")
+    sys.exit(1)
 
 def parse_args():
   print("Parsing command line args...")
