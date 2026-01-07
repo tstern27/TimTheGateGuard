@@ -38,20 +38,38 @@ def parse_config(config_file_path):
       missing_keys = list(set(CONFIG_KEYS) - set(config_json.keys()))
       if missing_keys: 
         print("Missing following keys from config: {}".format(missing_keys))
-        exit(-1)
-      return config_json["TOKEN"], config_json["project_path"]
-  except IOError:
-    print('Failed to open config file: {}'.format(config_file_path))
-    exit(-1)
+        sys.exit(1)
+      
+      project_path = config_json["project_path"]
+      # Validate project_path exists
+      if not os.path.isdir(project_path):
+        print("Error: project_path '{}' does not exist or is not a directory".format(project_path))
+        sys.exit(1)
+      
+      return config_json["TOKEN"], project_path
+  except IOError as e:
+    print('Failed to open config file: {} - {}'.format(config_file_path, str(e)))
+    sys.exit(1)
+  except json.JSONDecodeError as e:
+    print('Failed to parse config file: {} - {}'.format(config_file_path, str(e)))
+    sys.exit(1)
 
 async def parse_cogs(project_path):
   print("Parsing cogs...")
   # Parse cog files
+  cogs_dir = os.path.join(project_path, 'cogs')
+  if not os.path.isdir(cogs_dir):
+    print("Error: cogs directory '{}' does not exist".format(cogs_dir))
+    sys.exit(1)
+  
   count = 0
-  for filename in os.listdir('{}/cogs'.format(project_path)):
-    if filename.endswith('.py'):
-      count += 1
-      await client.load_extension(f'cogs.{filename[:-3]}')
+  for filename in os.listdir(cogs_dir):
+    if filename.endswith('.py') and not filename.startswith('__'):
+      try:
+        await client.load_extension(f'cogs.{filename[:-3]}')
+        count += 1
+      except Exception as e:
+        print("Warning: Failed to load cog '{}': {}".format(filename, str(e)))
   print("   parsed {} cogs".format(count))
 
 

@@ -1,11 +1,10 @@
 import discord
 from discord.ext import commands
-import time
-from datetime import datetime, timedelta
 import logging
 import asyncio
 import sys
-from discord.utils import get
+import json
+import os
 
 # Set up logging
 logging.basicConfig(
@@ -20,7 +19,6 @@ logger = logging.getLogger('MusicBot')
 
 # Import YTDLSource with error handling
 try:
-    sys.path.insert(0, "..")
     from lib.YTDLSource import YTDLSource
     logger.info("Successfully imported YTDLSource")
 except ImportError as e:
@@ -32,7 +30,79 @@ class Music(commands.Cog):
         self.bot = bot
         self.voice_clients = {}
         self.current_channels = {}
-        logger.info("Music cog initialized")
+        # Use absolute path for stats file in project root
+        # Get the directory where this file is located (cogs/)
+        cogs_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(cogs_dir)  # Go up one level from cogs/ to project root
+        self.stats_file = os.path.join(project_root, 'play_stats.json')
+        
+        # Verify the project root directory exists and is writable
+        if not os.path.isdir(project_root):
+            logger.error(f"Project root directory does not exist: {project_root}")
+        elif not os.access(project_root, os.W_OK):
+            logger.warning(f"Project root directory is not writable: {project_root}. Stats may not save correctly.")
+        else:
+            logger.info(f"Music cog initialized. Stats file: {self.stats_file}")
+    
+    def _load_stats(self):
+        """Load play statistics from JSON file"""
+        if os.path.exists(self.stats_file):
+            try:
+                with open(self.stats_file, 'r', encoding='utf-8') as f:
+                    stats = json.load(f)
+                    logger.debug(f"Loaded stats from {self.stats_file}")
+                    return stats
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing stats file (corrupted?): {e}. Creating backup and starting fresh.")
+                # Backup corrupted file
+                backup_file = self.stats_file + '.corrupted'
+                try:
+                    os.rename(self.stats_file, backup_file)
+                    logger.info(f"Backed up corrupted stats to {backup_file}")
+                except:
+                    pass
+                return {}
+            except IOError as e:
+                logger.error(f"Error reading stats file: {e}")
+                return {}
+        return {}
+    
+    def _save_stats(self, stats):
+        """Save play statistics to JSON file with atomic write"""
+        try:
+            # Use atomic write: write to temp file first, then rename
+            temp_file = self.stats_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(stats, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+            
+            # Atomic rename (works on Unix and Windows)
+            os.replace(temp_file, self.stats_file)
+            logger.debug(f"Saved stats to {self.stats_file}")
+        except IOError as e:
+            logger.error(f"Error saving stats to {self.stats_file}: {e}", exc_info=True)
+            # Try to clean up temp file if it exists
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def _track_play(self, channel_id, track_title):
+        """Track a play for a specific channel and track"""
+        stats = self._load_stats()
+        channel_id_str = str(channel_id)
+        
+        if channel_id_str not in stats:
+            stats[channel_id_str] = {}
+        
+        if track_title not in stats[channel_id_str]:
+            stats[channel_id_str][track_title] = 0
+        
+        stats[channel_id_str][track_title] += 1
+        self._save_stats(stats)
+        logger.debug(f"Tracked play: {track_title} in channel {channel_id_str}")
 
     def get_voice_client(self, guild_id):
         """Get voice client for specific guild"""
@@ -55,9 +125,27 @@ class Music(commands.Cog):
             del self.current_channels[guild_id]
             logger.info(f"Removed current channel for guild {guild_id}")
 
+    async def clear_all_voice_connections(self):
+        """Disconnect from all voice channels and clear state"""
+        logger.info("Clearing all voice connections")
+        disconnected_count = 0
+        for guild_id, voice_client in list(self.voice_clients.items()):
+            try:
+                if voice_client and voice_client.is_connected():
+                    await voice_client.disconnect()
+                    disconnected_count += 1
+                    logger.info(f"Disconnected from voice channel in guild {guild_id}")
+            except Exception as e:
+                logger.error(f"Error disconnecting from guild {guild_id}: {str(e)}", exc_info=True)
+            finally:
+                self.remove_voice_client(guild_id)
+        logger.info(f"Cleared {disconnected_count} voice connection(s)")
+        return disconnected_count
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        """Monitor voice state changes for debugging"""
+        """Monitor voice state changes and auto-disconnect when alone"""
+        # Handle bot's own voice state changes
         if member == self.bot.user:
             logger.info(f"Bot voice state changed - Before: {before.channel}, After: {after.channel}")
             if before.channel and not after.channel:
@@ -67,6 +155,32 @@ class Music(commands.Cog):
                 if guild_id in self.voice_clients:
                     logger.info(f"Cleaning up voice client tracking for guild {guild_id}")
                     self.remove_voice_client(guild_id)
+            return
+        
+        # Handle other members leaving channels the bot is in
+        # Only check when someone leaves a channel (not when they join or switch)
+        if before.channel is None:
+            return  # Member didn't leave any channel
+        
+        voice_client = self.get_voice_client(member.guild.id)
+        if voice_client and voice_client.is_connected():
+            channel = voice_client.channel
+            # Only check if they left the channel the bot is in
+            if channel and before.channel.id == channel.id:
+                # Count members in channel (excluding bots)
+                members_in_channel = [m for m in channel.members if not m.bot]
+                
+                # If only the bot remains, disconnect
+                if len(members_in_channel) == 0:
+                    logger.info(f"Bot is alone in {channel.name}, disconnecting...")
+                    try:
+                        await voice_client.disconnect()
+                        self.remove_voice_client(member.guild.id)
+                        logger.info(f"Disconnected from {channel.name} due to being alone")
+                    except Exception as e:
+                        logger.error(f"Error disconnecting when alone: {str(e)}", exc_info=True)
+                        # Force cleanup even if disconnect failed
+                        self.remove_voice_client(member.guild.id)
 
     @commands.command()
     async def join(self, ctx, *, channel: discord.VoiceChannel):
@@ -78,8 +192,11 @@ class Music(commands.Cog):
             current_vc = self.get_voice_client(ctx.guild.id)
             if current_vc:
                 if current_vc.is_connected():
-                    logger.info(f"Already connected to {self.current_channels[ctx.guild.id].name}")
-                    return await ctx.send(f"Already connected to {self.current_channels[ctx.guild.id].name}")
+                    channel_name = self.current_channels.get(ctx.guild.id, "unknown channel")
+                    if isinstance(channel_name, discord.VoiceChannel):
+                        channel_name = channel_name.name
+                    logger.info(f"Already connected to {channel_name}")
+                    return await ctx.send(f"Already connected to {channel_name}")
                 else:
                     logger.warning(f"Voice client exists but not connected, cleaning up")
                     self.remove_voice_client(ctx.guild.id)
@@ -141,9 +258,9 @@ class Music(commands.Cog):
             logger.info(f"No voice client found when leave called in {ctx.guild.name}")
             await ctx.send("Not connected to a voice channel")
 
-    @commands.command(pass_context=True, aliases=['p'])
+    @commands.command(aliases=['p'])
     async def play(self, ctx, url, timestamp='0'):
-        """Plays audio from a youtube url"""
+        """Plays audio from a URL (YouTube, etc.)"""
         logger.info(f"Play command called by {ctx.author} in guild {ctx.guild.name} with URL: {url}")
         
         try:
@@ -186,13 +303,23 @@ class Music(commands.Cog):
             # Parse timestamp
             ffmpeg_options = {'options': '-vn'}
             pre_op = '-ss 0'
-            if '-' in timestamp:
-                start, stop = timestamp.split('-')
-                pre_op = f'-ss {start} -to {stop}'
-                logger.info(f"Using timestamp range: {start} to {stop}")
-            elif timestamp != '0':
-                pre_op = f'-ss {timestamp}'
-                logger.info(f"Using timestamp: {timestamp}")
+            if timestamp and timestamp != '0':
+                # Validate timestamp format (basic check)
+                timestamp = timestamp.strip()
+                if '-' in timestamp:
+                    parts = timestamp.split('-', 1)  # Split only on first dash
+                    if len(parts) == 2:
+                        start, stop = parts[0].strip(), parts[1].strip()
+                        if start and stop:
+                            pre_op = f'-ss {start} -to {stop}'
+                            logger.info(f"Using timestamp range: {start} to {stop}")
+                        else:
+                            logger.warning(f"Invalid timestamp range format: {timestamp}")
+                    else:
+                        logger.warning(f"Invalid timestamp range format: {timestamp}")
+                else:
+                    pre_op = f'-ss {timestamp}'
+                    logger.info(f"Using timestamp: {timestamp}")
 
             # Add status message
             await ctx.send("Fetching audio... This may take a moment.")
@@ -221,6 +348,9 @@ class Music(commands.Cog):
             voice_client.play(player, after=after_playing)
             logger.info(f'Started playing: {player.title}')
             
+            # Track the play for statistics
+            self._track_play(ctx.channel.id, player.title)
+            
             return await ctx.send(f'Now playing: {player.title}')
 
         except Exception as e:
@@ -243,14 +373,20 @@ class Music(commands.Cog):
             return await ctx.send("Volume must be between 0 and 100.")
 
         try:
+            if not voice_client.source:
+                logger.warning("No audio source available to change volume")
+                return await ctx.send("No audio is currently playing.")
             voice_client.source.volume = volume / 100
             logger.info(f"Changed volume to {volume}%")
             await ctx.send("Changed volume to {}%".format(volume))
+        except AttributeError:
+            logger.warning("Audio source does not support volume control")
+            await ctx.send("Current audio source does not support volume control.")
         except Exception as e:
             logger.error(f"Error changing volume: {str(e)}", exc_info=True)
             await ctx.send("Error changing volume.")
 
-    @commands.command(pass_context=True, aliases=['pa', 'pau'])
+    @commands.command(aliases=['pa', 'pau'])
     async def pause(self, ctx):
         """Pause the current audio"""
         logger.info(f"Pause command called by {ctx.author} in guild {ctx.guild.name}")
@@ -265,7 +401,7 @@ class Music(commands.Cog):
             logger.info(f"Music not playing when pause called in {ctx.guild.name}")
             await ctx.send("Music not playing")
 
-    @commands.command(pass_context=True, aliases=['r', 'res'])
+    @commands.command(aliases=['r', 'res'])
     async def resume(self, ctx):
         """Resume the current audio"""
         logger.info(f"Resume command called by {ctx.author} in guild {ctx.guild.name}")
@@ -280,7 +416,7 @@ class Music(commands.Cog):
             logger.info(f"Music is not paused in {ctx.guild.name}")
             await ctx.send("Music is not paused")
 
-    @commands.command(pass_context=True, aliases=['s', 'sto'])
+    @commands.command(aliases=['s', 'sto'])
     async def stop(self, ctx):
         """Stop the current audio"""
         logger.info(f"Stop command called by {ctx.author} in guild {ctx.guild.name}")
@@ -315,6 +451,117 @@ class Music(commands.Cog):
             status = "No voice client found"
         
         await ctx.send(f"```\nBot Status:\n{status}\n```")
+
+    async def _parse_channel_history(self, channel):
+        """Parse channel message history to build play statistics"""
+        logger.info(f"Parsing message history for channel {channel.id}")
+        stats = {}
+        
+        try:
+            # Check bot permissions
+            if not channel.permissions_for(channel.guild.me).read_message_history:
+                logger.warning(f"No permission to read message history in {channel.name}")
+                return None
+            
+            # Look for "Now playing:" messages from the bot
+            async for message in channel.history(limit=None):
+                if message.author == self.bot.user:
+                    # Check if this is a "Now playing:" message
+                    content = message.content
+                    if content.startswith("Now playing:"):
+                        # Extract track name (everything after "Now playing: ")
+                        track_name = content.replace("Now playing:", "").strip()
+                        if track_name:
+                            if track_name not in stats:
+                                stats[track_name] = 0
+                            stats[track_name] += 1
+            
+            logger.info(f"Parsed {sum(stats.values())} total plays from {len(stats)} unique tracks")
+            return stats
+        except Exception as e:
+            logger.error(f"Error parsing channel history: {e}", exc_info=True)
+            return None
+
+    @commands.command(aliases=['top', 'stats'])
+    async def toptracks(self, ctx, *, args: str = None):
+        """Shows top 10 most played tracks in specified channel (or current). Use 'rescan' to force rescan."""
+        # Parse arguments - check for "rescan" keyword
+        force_rescan = False
+        channel = None
+        
+        if args:
+            args_lower = args.lower().strip()
+            # Check if "rescan" is in the arguments
+            if 'rescan' in args_lower:
+                force_rescan = True
+                # Try to extract channel name if provided (remove "rescan" keyword)
+                channel_str = args_lower.replace('rescan', '').strip()
+                if channel_str:
+                    # Try to parse as channel
+                    try:
+                        channel = await commands.TextChannelConverter().convert(ctx, channel_str)
+                    except commands.BadArgument:
+                        # Not a valid channel, ignore
+                        pass
+            else:
+                # Try to parse as channel
+                try:
+                    channel = await commands.TextChannelConverter().convert(ctx, args)
+                except commands.BadArgument:
+                    # Not a valid channel, ignore
+                    pass
+        
+        # Use current channel if none specified
+        if channel is None:
+            channel = ctx.channel
+        
+        stats = self._load_stats()
+        channel_id_str = str(channel.id)
+        
+        # Force rescan if requested, or if no stats exist
+        should_rescan = force_rescan or (channel_id_str not in stats or not stats[channel_id_str])
+        
+        if should_rescan:
+            if force_rescan:
+                await ctx.send(f"Rescanning message history for {channel.mention}... This may take a moment.")
+            else:
+                await ctx.send(f"No statistics found. Parsing message history for {channel.mention}... This may take a moment.")
+            
+            parsed_stats = await self._parse_channel_history(channel)
+            
+            if parsed_stats is None:
+                return await ctx.send(f"Could not parse message history. Make sure I have permission to read message history in {channel.mention}")
+            
+            if not parsed_stats:
+                return await ctx.send(f"No play history found in {channel.mention}")
+            
+            # Save the parsed stats (replace entirely on force rescan to avoid double-counting)
+            stats[channel_id_str] = parsed_stats
+            
+            self._save_stats(stats)
+            total_plays = sum(stats[channel_id_str].values())
+            await ctx.send(f"Parsed {sum(parsed_stats.values())} plays from message history. Total: {total_plays} plays.")
+        
+        # Get tracks for this channel and sort by play count
+        channel_stats = stats[channel_id_str]
+        sorted_tracks = sorted(channel_stats.items(), key=lambda x: x[1], reverse=True)
+        
+        # Get top 10
+        top_tracks = sorted_tracks[:10]
+        
+        if not top_tracks:
+            return await ctx.send(f"No play statistics found for {channel.mention}")
+        
+        # Format output
+        lines = [f"Top tracks in {channel.mention}:"]
+        lines.append("```")
+        for rank, (track_name, play_count) in enumerate(top_tracks, 1):
+            # Truncate long track names
+            display_name = track_name[:60] + "..." if len(track_name) > 60 else track_name
+            lines.append(f"{rank}. {display_name} - {play_count} play(s)")
+        lines.append("```")
+        
+        await ctx.send("\n".join(lines))
 
 async def setup(client):
     await client.add_cog(Music(client))

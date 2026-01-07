@@ -7,3 +7,10 @@ config/*
 
 #Ignore the venv
 venv
+
+# Statistics and data files
+play_stats.json
+play_stats.json.tmp
+play_stats.json.corrupted
+
+bot.log
