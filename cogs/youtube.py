@@ -35,6 +35,7 @@ class Music(commands.Cog):
         cogs_dir = os.path.dirname(os.path.abspath(__file__))
         project_root = os.path.dirname(cogs_dir)  # Go up one level from cogs/ to project root
         self.stats_file = os.path.join(project_root, 'play_stats.json')
+        self.saved_songs_file = os.path.join(project_root, 'saved_songs.json')
         
         # Verify the project root directory exists and is writable
         if not os.path.isdir(project_root):
@@ -42,7 +43,7 @@ class Music(commands.Cog):
         elif not os.access(project_root, os.W_OK):
             logger.warning(f"Project root directory is not writable: {project_root}. Stats may not save correctly.")
         else:
-            logger.info(f"Music cog initialized. Stats file: {self.stats_file}")
+            logger.info(f"Music cog initialized. Stats file: {self.stats_file}, Saved songs file: {self.saved_songs_file}")
     
     def _load_stats(self):
         """Load play statistics from JSON file"""
@@ -82,6 +83,51 @@ class Music(commands.Cog):
             logger.debug(f"Saved stats to {self.stats_file}")
         except IOError as e:
             logger.error(f"Error saving stats to {self.stats_file}: {e}", exc_info=True)
+            # Try to clean up temp file if it exists
+            try:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+            except:
+                pass
+    
+    def _load_saved_songs(self):
+        """Load saved songs from JSON file"""
+        if os.path.exists(self.saved_songs_file):
+            try:
+                with open(self.saved_songs_file, 'r', encoding='utf-8') as f:
+                    saved_songs = json.load(f)
+                    logger.debug(f"Loaded saved songs from {self.saved_songs_file}")
+                    return saved_songs
+            except json.JSONDecodeError as e:
+                logger.error(f"Error parsing saved songs file (corrupted?): {e}. Creating backup and starting fresh.")
+                # Backup corrupted file
+                backup_file = self.saved_songs_file + '.corrupted'
+                try:
+                    os.rename(self.saved_songs_file, backup_file)
+                    logger.info(f"Backed up corrupted saved songs to {backup_file}")
+                except:
+                    pass
+                return {}
+            except IOError as e:
+                logger.error(f"Error reading saved songs file: {e}")
+                return {}
+        return {}
+    
+    def _save_saved_songs(self, saved_songs):
+        """Save saved songs to JSON file with atomic write"""
+        try:
+            # Use atomic write: write to temp file first, then rename
+            temp_file = self.saved_songs_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(saved_songs, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())  # Force write to disk
+            
+            # Atomic rename (works on Unix and Windows)
+            os.replace(temp_file, self.saved_songs_file)
+            logger.debug(f"Saved songs to {self.saved_songs_file}")
+        except IOError as e:
+            logger.error(f"Error saving saved songs to {self.saved_songs_file}: {e}", exc_info=True)
             # Try to clean up temp file if it exists
             try:
                 if os.path.exists(temp_file):
@@ -313,9 +359,53 @@ class Music(commands.Cog):
             await ctx.send("Not connected to a voice channel")
 
     @commands.command(aliases=['p'])
-    async def play(self, ctx, url, timestamp='0'):
-        """Plays audio from a URL (YouTube, etc.)"""
-        logger.info(f"Play command called by {ctx.author} in guild {ctx.guild.name} with URL: {url}")
+    async def play(self, ctx, *, args: str = None):
+        """Plays audio from a URL (YouTube, etc.) or a saved song name.
+        Usage: -play <url> [timestamp] OR -play <saved_name>
+        """
+        if not args:
+            return await ctx.send("Usage: `-play <url> [timestamp]` or `-play <saved_name>`")
+        
+        logger.info(f"Play command called by {ctx.author} in guild {ctx.guild.name} with args: {args}")
+        
+        # Check if this is a saved song name
+        saved_songs = self._load_saved_songs()
+        
+        # Parse arguments - check if it's a saved name or URL
+        parts = args.split()
+        first_arg = parts[0]
+        
+        # Check if it's a saved name (not a URL)
+        url = None
+        timestamp = '0'
+        
+        # First check if the entire args string is a saved name (handles names with spaces)
+        if args in saved_songs:
+            saved_song = saved_songs[args]
+            url = saved_song['url']
+            timestamp = saved_song.get('timestamp', '0')
+            logger.info(f"Playing saved song '{args}': {url} with timestamp {timestamp}")
+        # Then check if first word is a saved name (for single-word names)
+        elif first_arg in saved_songs and not (first_arg.startswith('http://') or first_arg.startswith('https://')):
+            saved_song = saved_songs[first_arg]
+            url = saved_song['url']
+            timestamp = saved_song.get('timestamp', '0')
+            logger.info(f"Playing saved song '{first_arg}': {url} with timestamp {timestamp}")
+        # Check if it's a URL
+        elif first_arg.startswith('http://') or first_arg.startswith('https://'):
+            url = first_arg
+            if len(parts) > 1:
+                timestamp = parts[1]
+            logger.info(f"Playing URL: {url} with timestamp: {timestamp}")
+        else:
+            # Not a URL and not a saved name - treat as URL anyway (let yt-dlp handle the error)
+            url = first_arg
+            if len(parts) > 1:
+                timestamp = parts[1]
+            logger.info(f"Treating as URL (may fail): {url} with timestamp: {timestamp}")
+        
+        if not url:
+            return await ctx.send("Could not determine what to play. Please provide a URL or saved song name.")
         
         try:
             # Check if user is in a voice channel
@@ -524,6 +614,188 @@ class Music(commands.Cog):
         except Exception as e:
             logger.error(f"Play command error: {str(e)}", exc_info=True)
             return await ctx.send("An error occurred while trying to play the audio.")
+
+    @commands.command()
+    async def save(self, ctx, *, args: str = None):
+        """Saves a URL with optional timestamp and name for later playback.
+        Usage: -save <url> [timestamp] [force] <name>
+        Examples:
+        - -save https://youtube.com/watch?v=... my favorite song
+        - -save https://youtube.com/watch?v=... 1:30 my favorite song
+        - -save https://youtube.com/watch?v=... force my favorite song (overwrites existing)
+        - -save https://youtube.com/watch?v=... 1:30 force my favorite song (overwrites with timestamp)
+        """
+        if not args:
+            return await ctx.send("Usage: `-save <url> [timestamp] [force] <name>`")
+        
+        logger.info(f"Save command called by {ctx.author} in guild {ctx.guild.name} with args: {args}")
+        
+        # Parse arguments
+        parts = args.split()
+        if len(parts) < 2:
+            return await ctx.send("Usage: `-save <url> [timestamp] [force] <name>`\nYou need to provide at least a URL and a name.")
+        
+        url = parts[0]
+        # Validate URL (basic check)
+        if not (url.startswith('http://') or url.startswith('https://')):
+            return await ctx.send("The first argument must be a valid URL (starting with http:// or https://)")
+        
+        # Check for "force" keyword and parse remaining arguments
+        force = False
+        timestamp = None
+        name_parts = []
+        
+        # Start from index 1 (after URL)
+        i = 1
+        
+        # First pass: identify if there's a timestamp and where "force" is
+        timestamp_index = -1
+        force_index = -1
+        
+        for j in range(i, len(parts)):
+            if parts[j].lower() == 'force':
+                force_index = j
+                break
+            elif timestamp_index == -1:  # Haven't found timestamp yet
+                potential_timestamp = parts[j]
+                # Check if this looks like a timestamp (contains ':' or is numeric with dashes)
+                if ':' in potential_timestamp or (potential_timestamp.replace('-', '').replace(':', '').isdigit() and '-' in potential_timestamp):
+                    timestamp_index = j
+                    timestamp = potential_timestamp
+        
+        # Now determine what the name is
+        if force_index != -1:
+            # "force" keyword found - everything after it is the name
+            force = True
+            name_parts = parts[force_index + 1:]
+        elif timestamp_index != -1:
+            # Timestamp found but no force - everything after timestamp is the name
+            name_parts = parts[timestamp_index + 1:]
+        else:
+            # No timestamp, no force - everything after URL is the name
+            name_parts = parts[i:]
+        
+        if not name_parts:
+            return await ctx.send("You must provide a name for the saved song.")
+        
+        name = ' '.join(name_parts).strip()
+        if not name:
+            return await ctx.send("The name cannot be empty.")
+        
+        # Load existing saved songs
+        saved_songs = self._load_saved_songs()
+        
+        # Check if name already exists
+        name_exists = name in saved_songs
+        if name_exists:
+            if not force:
+                return await ctx.send(f"A saved song with the name '{name}' already exists. Use `force` before the name to overwrite it.\nExample: `-save {url} force {name}`")
+            else:
+                logger.info(f"Overwriting existing saved song: {name}")
+        
+        # Save the song
+        saved_songs[name] = {
+            'url': url,
+            'timestamp': timestamp if timestamp else '0'
+        }
+        
+        self._save_saved_songs(saved_songs)
+        
+        timestamp_msg = f" with timestamp {timestamp}" if timestamp else ""
+        overwrite_msg = " (overwritten)" if name_exists else ""
+        logger.info(f"Saved song '{name}' with URL {url}{timestamp_msg}")
+        return await ctx.send(f"Saved '{name}'{timestamp_msg}{overwrite_msg}")
+
+    @commands.command(aliases=['list-saved'])
+    async def listsaved(self, ctx):
+        """Lists all saved songs"""
+        logger.info(f"List saved command called by {ctx.author} in guild {ctx.guild.name}")
+        
+        saved_songs = self._load_saved_songs()
+        
+        if not saved_songs:
+            return await ctx.send("No saved songs found.")
+        
+        # Format output
+        lines = ["Saved songs:"]
+        lines.append("```")
+        
+        # Sort by name for consistent display
+        sorted_songs = sorted(saved_songs.items(), key=lambda x: x[0].lower())
+        
+        for name, song_data in sorted_songs:
+            url = song_data['url']
+            timestamp = song_data.get('timestamp', '0')
+            # Truncate long URLs for display
+            display_url = url[:50] + "..." if len(url) > 50 else url
+            timestamp_display = f" (timestamp: {timestamp})" if timestamp and timestamp != '0' else ""
+            lines.append(f"• {name}{timestamp_display}")
+            lines.append(f"  {display_url}")
+        
+        lines.append("```")
+        
+        # Discord message limit is 2000 characters, split if needed
+        message = "\n".join(lines)
+        if len(message) > 2000:
+            # Split into multiple messages
+            current_message = ["Saved songs:"]
+            current_message.append("```")
+            current_length = len("\n".join(current_message)) + 3  # +3 for closing ```
+            
+            for name, song_data in sorted_songs:
+                url = song_data['url']
+                timestamp = song_data.get('timestamp', '0')
+                display_url = url[:50] + "..." if len(url) > 50 else url
+                timestamp_display = f" (timestamp: {timestamp})" if timestamp and timestamp != '0' else ""
+                entry = f"• {name}{timestamp_display}\n  {display_url}"
+                
+                if current_length + len(entry) + 10 > 2000:  # +10 for safety margin
+                    current_message.append("```")
+                    await ctx.send("\n".join(current_message))
+                    current_message = ["```"]
+                    current_length = 3
+                
+                current_message.append(entry)
+                current_length += len(entry) + 1  # +1 for newline
+            
+            if len(current_message) > 1:  # More than just "```"
+                current_message.append("```")
+                await ctx.send("\n".join(current_message))
+        else:
+            await ctx.send(message)
+
+    @commands.command()
+    @commands.has_permissions(administrator=True)
+    async def delete(self, ctx, *, name: str = None):
+        """Deletes a saved song by name (requires administrator permissions).
+        Usage: -delete <name>
+        Example: -delete my favorite song
+        """
+        if not name:
+            return await ctx.send("Usage: `-delete <name>`\nExample: `-delete my favorite song`")
+        
+        logger.info(f"Delete command called by {ctx.author} in guild {ctx.guild.name} for name: {name}")
+        
+        saved_songs = self._load_saved_songs()
+        
+        if name not in saved_songs:
+            return await ctx.send(f"No saved song found with the name '{name}'.")
+        
+        # Delete the song
+        deleted_song = saved_songs.pop(name)
+        self._save_saved_songs(saved_songs)
+        
+        logger.info(f"Deleted saved song '{name}'")
+        return await ctx.send(f"Deleted saved song '{name}'")
+    
+    @delete.error
+    async def delete_error(self, ctx, error):
+        """Error handler for delete command"""
+        if isinstance(error, commands.MissingPermissions):
+            logger.info(f"Delete command denied for {ctx.author} in guild {ctx.guild.name} - missing administrator permissions")
+            return await ctx.send("You don't have permission to delete saved songs. This command requires administrator permissions.")
+        # Re-raise other errors so they can be handled elsewhere
+        raise error
 
     @commands.command()
     async def volume(self, ctx, volume: int):
