@@ -126,19 +126,49 @@ class Music(commands.Cog):
             logger.info(f"Removed current channel for guild {guild_id}")
 
     async def clear_all_voice_connections(self):
-        """Disconnect from all voice channels and clear state"""
-        logger.info("Clearing all voice connections")
+        """Disconnect from all voice channels and clear state aggressively"""
+        logger.info("Clearing all voice connections (aggressive mode)")
         disconnected_count = 0
+        
+        # First, disconnect all tracked voice clients
         for guild_id, voice_client in list(self.voice_clients.items()):
             try:
-                if voice_client and voice_client.is_connected():
-                    await voice_client.disconnect()
-                    disconnected_count += 1
-                    logger.info(f"Disconnected from voice channel in guild {guild_id}")
+                if voice_client:
+                    try:
+                        await voice_client.disconnect(force=True)
+                        disconnected_count += 1
+                        logger.info(f"Disconnected tracked voice client in guild {guild_id}")
+                    except Exception as e:
+                        logger.warning(f"Error disconnecting tracked client for guild {guild_id}: {e}")
             except Exception as e:
-                logger.error(f"Error disconnecting from guild {guild_id}: {str(e)}", exc_info=True)
+                logger.error(f"Error with voice client for guild {guild_id}: {str(e)}", exc_info=True)
             finally:
                 self.remove_voice_client(guild_id)
+        
+        # Second, check all guilds the bot is in and disconnect from any voice channels
+        # This catches cases where the bot is in a channel but not tracked in voice_clients
+        for guild in self.bot.guilds:
+            try:
+                bot_voice_state = guild.me.voice
+                if bot_voice_state and bot_voice_state.channel:
+                    # Bot is in a voice channel, force disconnect
+                    vc = guild.voice_client
+                    if vc:
+                        try:
+                            await vc.disconnect(force=True)
+                            if guild.id not in self.voice_clients:
+                                disconnected_count += 1
+                            logger.info(f"Force disconnected from voice channel in guild {guild.name} (id: {guild.id})")
+                        except Exception as e:
+                            logger.warning(f"Error force disconnecting from guild {guild.name}: {e}")
+                    # Clean up tracking even if disconnect failed
+                    self.remove_voice_client(guild.id)
+            except Exception as e:
+                logger.error(f"Error checking/clearing voice state for guild {guild.name}: {e}")
+        
+        # Small delay to let disconnects settle
+        await asyncio.sleep(0.5)
+        
         logger.info(f"Cleared {disconnected_count} voice connection(s)")
         return disconnected_count
 
@@ -239,13 +269,32 @@ class Music(commands.Cog):
         logger.info(f"Leave command called by {ctx.author} in guild {ctx.guild.name}")
         
         voice_client = self.get_voice_client(ctx.guild.id)
-        if voice_client is not None:
+        bot_voice_state = ctx.guild.me.voice
+        
+        # Check if bot is actually in a voice channel (even if voice_client is stale)
+        if bot_voice_state and bot_voice_state.channel:
+            # Bot is in a channel, disconnect it
             try:
-                if voice_client.is_connected():
-                    await voice_client.disconnect()
-                    logger.info(f"Successfully disconnected from voice channel in {ctx.guild.name}")
+                # Try to use tracked voice_client first
+                if voice_client:
+                    try:
+                        await voice_client.disconnect(force=True)
+                        logger.info(f"Successfully disconnected tracked voice client in {ctx.guild.name}")
+                    except Exception as e:
+                        logger.warning(f"Error disconnecting tracked client: {e}, trying guild.voice_client")
+                        # Fall back to guild.voice_client
+                        vc = ctx.guild.voice_client
+                        if vc:
+                            await vc.disconnect(force=True)
+                            logger.info(f"Successfully disconnected via guild.voice_client in {ctx.guild.name}")
                 else:
-                    logger.warning(f"Voice client not connected when leave called in {ctx.guild.name}")
+                    # No tracked client, use guild.voice_client
+                    vc = ctx.guild.voice_client
+                    if vc:
+                        await vc.disconnect(force=True)
+                        logger.info(f"Successfully disconnected via guild.voice_client in {ctx.guild.name}")
+                    else:
+                        logger.warning("Bot in channel but no voice_client found, forcing cleanup")
                 
                 self.remove_voice_client(ctx.guild.id)
                 await ctx.send("Left voice channel")
@@ -254,6 +303,11 @@ class Music(commands.Cog):
                 # Force cleanup even if disconnect failed
                 self.remove_voice_client(ctx.guild.id)
                 await ctx.send("Forced disconnect due to error")
+        elif voice_client is not None:
+            # Have a tracked client but bot not in channel (stale state)
+            logger.warning(f"Stale voice client found when leave called in {ctx.guild.name}, cleaning up")
+            self.remove_voice_client(ctx.guild.id)
+            await ctx.send("Cleaned up stale connection")
         else:
             logger.info(f"No voice client found when leave called in {ctx.guild.name}")
             await ctx.send("Not connected to a voice channel")
@@ -271,22 +325,136 @@ class Music(commands.Cog):
 
             # Get current voice client for this guild
             voice_client = self.get_voice_client(ctx.guild.id)
+            
+            # Check actual Discord state - bot might be in a channel even if voice_client is stale
+            bot_voice_state = ctx.guild.me.voice
+            target_channel = ctx.author.voice.channel
+            
+            # If bot is in a different channel, disconnect first
+            if bot_voice_state and bot_voice_state.channel:
+                if bot_voice_state.channel.id != target_channel.id:
+                    logger.info(f"Bot is in different channel ({bot_voice_state.channel.name}), disconnecting first")
+                    try:
+                        if voice_client:
+                            await voice_client.disconnect(force=True)
+                        else:
+                            # Try to get the voice client from the guild
+                            vc = ctx.guild.voice_client
+                            if vc:
+                                await vc.disconnect(force=True)
+                    except Exception as e:
+                        logger.warning(f"Error disconnecting from old channel: {e}")
+                    finally:
+                        self.remove_voice_client(ctx.guild.id)
+                        await asyncio.sleep(0.5)
+                elif voice_client is None or not voice_client.is_connected():
+                    # Bot is in the right channel but voice_client is stale, clean up
+                    logger.warning("Bot is in channel but voice_client is stale, cleaning up")
+                    try:
+                        vc = ctx.guild.voice_client
+                        if vc:
+                            await vc.disconnect(force=True)
+                    except Exception as e:
+                        logger.warning(f"Error cleaning up stale connection: {e}")
+                    finally:
+                        self.remove_voice_client(ctx.guild.id)
+                        await asyncio.sleep(0.5)
 
             # Connect to voice with timeout if not already connected
             if voice_client is None or not voice_client.is_connected():
-                logger.info(f"Connecting to voice channel {ctx.author.voice.channel.name}")
+                logger.info(f"Connecting to voice channel {target_channel.name}")
                 
                 try:
-                    # Clean up any existing non-connected client
-                    if voice_client and not voice_client.is_connected():
-                        self.remove_voice_client(ctx.guild.id)
-                    await asyncio.sleep(1)
-                    voice_client = await ctx.author.voice.channel.connect(timeout=20.0)
-                    await asyncio.sleep(1)
-                    self.set_voice_client(ctx.guild.id, voice_client)
-                    self.current_channels[ctx.guild.id] = ctx.author.voice.channel
-                    logger.info(f"Connected to {ctx.author.voice.channel.name} for playback")
+                    # Double-check we're not already connected (handle race conditions)
+                    bot_voice_state = ctx.guild.me.voice
+                    if bot_voice_state and bot_voice_state.channel and bot_voice_state.channel.id == target_channel.id:
+                        # We're already in the right channel, get the voice client
+                        voice_client = ctx.guild.voice_client
+                        if voice_client and voice_client.is_connected():
+                            logger.info("Already connected to target channel, using existing connection")
+                            self.set_voice_client(ctx.guild.id, voice_client)
+                            self.current_channels[ctx.guild.id] = target_channel
+                        else:
+                            # Stale connection, force disconnect and reconnect
+                            logger.warning("Stale connection detected, forcing disconnect")
+                            try:
+                                if voice_client:
+                                    await voice_client.disconnect(force=True)
+                                vc = ctx.guild.voice_client
+                                if vc:
+                                    await vc.disconnect(force=True)
+                            except:
+                                pass
+                            self.remove_voice_client(ctx.guild.id)
+                            await asyncio.sleep(0.5)
+                            voice_client = await target_channel.connect(timeout=20.0, reconnect=False)
+                            self.set_voice_client(ctx.guild.id, voice_client)
+                            self.current_channels[ctx.guild.id] = target_channel
+                            logger.info(f"Reconnected to {target_channel.name} for playback")
+                    else:
+                        # Not connected, connect fresh
+                        voice_client = await target_channel.connect(timeout=20.0, reconnect=False)
+                        self.set_voice_client(ctx.guild.id, voice_client)
+                        self.current_channels[ctx.guild.id] = target_channel
+                        logger.info(f"Connected to {target_channel.name} for playback")
                     
+                except discord.ClientException as e:
+                    # Handle "Already connected" error by checking actual state
+                    if "Already connected" in str(e):
+                        logger.warning("Got 'Already connected' error, checking actual state")
+                        bot_voice_state = ctx.guild.me.voice
+                        if bot_voice_state and bot_voice_state.channel:
+                            if bot_voice_state.channel.id == target_channel.id:
+                                # We're in the right channel, use existing connection
+                                voice_client = ctx.guild.voice_client
+                                if voice_client:
+                                    self.set_voice_client(ctx.guild.id, voice_client)
+                                    self.current_channels[ctx.guild.id] = target_channel
+                                    logger.info("Using existing connection after 'Already connected' error")
+                                else:
+                                    # Discord says we're connected but no voice_client, force cleanup
+                                    logger.error("Discord says connected but no voice_client, forcing cleanup")
+                                    try:
+                                        vc = ctx.guild.voice_client
+                                        if vc:
+                                            await vc.disconnect(force=True)
+                                    except:
+                                        pass
+                                    self.remove_voice_client(ctx.guild.id)
+                                    await asyncio.sleep(0.5)
+                                    voice_client = await target_channel.connect(timeout=20.0, reconnect=False)
+                                    self.set_voice_client(ctx.guild.id, voice_client)
+                                    self.current_channels[ctx.guild.id] = target_channel
+                            else:
+                                # We're in wrong channel, disconnect and reconnect
+                                logger.info("Bot in wrong channel, disconnecting and reconnecting")
+                                try:
+                                    vc = ctx.guild.voice_client
+                                    if vc:
+                                        await vc.disconnect(force=True)
+                                except:
+                                    pass
+                                self.remove_voice_client(ctx.guild.id)
+                                await asyncio.sleep(0.5)
+                                voice_client = await target_channel.connect(timeout=20.0, reconnect=False)
+                                self.set_voice_client(ctx.guild.id, voice_client)
+                                self.current_channels[ctx.guild.id] = target_channel
+                        else:
+                            # Discord says we're connected but bot_voice_state is None, force cleanup
+                            logger.error("Discord error but bot not in channel, forcing cleanup")
+                            try:
+                                vc = ctx.guild.voice_client
+                                if vc:
+                                    await vc.disconnect(force=True)
+                            except:
+                                pass
+                            self.remove_voice_client(ctx.guild.id)
+                            await asyncio.sleep(0.5)
+                            voice_client = await target_channel.connect(timeout=20.0, reconnect=False)
+                            self.set_voice_client(ctx.guild.id, voice_client)
+                            self.current_channels[ctx.guild.id] = target_channel
+                    else:
+                        raise
                 except asyncio.TimeoutError:
                     logger.error("Connection timed out during play command")
                     return await ctx.send("Connection timed out - please try again")
